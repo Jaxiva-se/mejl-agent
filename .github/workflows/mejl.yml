@@ -1,0 +1,129 @@
+# Mejlagenten: läser nya mejl i brevlådan och lägger ett utkast till svar i
+# utkastmappen, i samma tråd. Ingenting skickas: en människa läser, ändrar och skickar.
+#
+# Gör ingenting förrän variabeln MEJL_AGENT är "true". Importen av historiken körs för hand
+# (Run workflow, läge importera) en gång innan agenten slås på.
+#
+# Schemat är var 30:e minut mellan 07 och 21 svensk vintertid. Varje körning kostar en
+# Actions-minut, så tätare schema märks på kontot. GitHub kan dröja några minuter.
+#
+# Secrets: MEJL_IMAP_HOST, MEJL_IMAP_USER, MEJL_IMAP_PASSWORD, MEJL_D1_DATABASE_ID,
+# ANTHROPIC_API_KEY, CLOUDFLARE_ACCOUNT_ID, och MEJL_CLOUDFLARE_API_TOKEN (egen nyckel med bara
+# D1: Edit). Saknas den används CLOUDFLARE_API_TOKEN, som då också behöver D1: Edit.
+# Valfria variabler: MEJL_RAPPORT_SVAR, MEJL_UTESLUT, MEJL_UTKASTMAPP, MEJL_SKICKATMAPP, MEJL_FRAN, MEJL_EGNA, MEJL_MAX, CLAUDE_MODEL.
+name: Mejlagenten
+on:
+  schedule:
+    - cron: "7,37 6-20 * * *"
+    # Weekly report, Monday 06:23 UTC (07:23 Swedish winter time).
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      lage:
+        description: "kor: nya mejl får utkast. importera: läs in historiken till arkivet. prov: importera till en tillfällig databas på GitHub, utan Cloudflare, och skriv utkast till de senaste mejlen i inkorgen. mappar: visa brevlådans mappar och vilka som läses, utan att läsa några mejl. rapport: lägg veckorapporten i inkorgen nu."
+        type: choice
+        options: [kor, importera, prov, mappar, rapport]
+        default: kor
+      sedan:
+        description: "Bara för importera och prov: läs mejl från och med detta datum (2024-01-01). Tomt är allt."
+        required: false
+  pull_request:
+
+permissions:
+  contents: read
+jobs:
+  test:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with: { node-version: 22, cache: npm, cache-dependency-path: package-lock.json }
+      - run: npm ci
+      - run: npm test
+  mejl:
+    if: >-
+      (github.event_name == 'schedule' && vars.MEJL_AGENT == 'true') ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    # One run at a time, so two runs never draft the same mail.
+    concurrency: { group: mejl, cancel-in-progress: false }
+    # Write: rules chosen in a reply to the weekly report are saved in regler.md.
+    permissions:
+      contents: write
+    env:
+      MEJL_IMAP_HOST: ${{ secrets.MEJL_IMAP_HOST }}
+      MEJL_IMAP_USER: ${{ secrets.MEJL_IMAP_USER }}
+      MEJL_IMAP_PASSWORD: ${{ secrets.MEJL_IMAP_PASSWORD }}
+      MEJL_D1_DATABASE_ID: ${{ secrets.MEJL_D1_DATABASE_ID }}
+      # Own token with only D1: Edit, if set. Otherwise the publishing token, which then needs D1: Edit too.
+      CLOUDFLARE_API_TOKEN: ${{ secrets.MEJL_CLOUDFLARE_API_TOKEN || secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL || 'claude-sonnet-5-5' }}
+      MEJL_UTKASTMAPP: ${{ vars.MEJL_UTKASTMAPP }}
+      MEJL_SKICKATMAPP: ${{ vars.MEJL_SKICKATMAPP }}
+      # Folders the import never reads, comma separated, for example "Löner, Läraransökningar".
+      MEJL_UTESLUT: ${{ vars.MEJL_UTESLUT }}
+      # Where replies to the weekly report go. Empty: the mailbox itself.
+      MEJL_RAPPORT_SVAR: ${{ vars.MEJL_RAPPORT_SVAR }}
+      MEJL_FRAN: ${{ vars.MEJL_FRAN }}
+      MEJL_EGNA: ${{ vars.MEJL_EGNA }}
+      MEJL_MAX: ${{ vars.MEJL_MAX || 10 }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with: { node-version: 22, cache: npm, cache-dependency-path: package-lock.json }
+      - run: npm ci --omit=dev
+      - name: Kontrollera att databasen är inställd
+        if: inputs.lage != 'prov' && inputs.lage != 'mappar'
+        # Without it the archive would land in a file on the runner and vanish with it.
+        run: |
+          if [ -z "$MEJL_D1_DATABASE_ID" ]; then echo "MEJL_D1_DATABASE_ID saknas, se README.md"; exit 1; fi
+      - name: Importera historiken
+        if: github.event_name == 'workflow_dispatch' && inputs.lage == 'importera'
+        env:
+          SEDAN: ${{ inputs.sedan }}
+        run: |
+          if [ -n "$SEDAN" ]; then node importera.mjs --sedan "$SEDAN"; else node importera.mjs; fi
+      - name: Visa mapparna
+        # Folder names and counts only: no mail is read, nothing is stored.
+        if: github.event_name == 'workflow_dispatch' && inputs.lage == 'mappar'
+        run: node importera.mjs --bara-mappar
+      - name: Prov utan databas
+        # The archive goes to a file on the runner and vanishes with it: nothing is read from or
+        # written to Cloudflare. Then the latest mails in the inbox (MEJL_MAX) get real drafts.
+        if: github.event_name == 'workflow_dispatch' && inputs.lage == 'prov'
+        env:
+          SEDAN: ${{ inputs.sedan }}
+          MEJL_D1_DATABASE_ID: ""
+          MEJL_DB: ${{ runner.temp }}/prov.sqlite
+          MEJL_PROV_SENASTE: ${{ vars.MEJL_MAX || 10 }}
+        run: |
+          if [ -n "$SEDAN" ]; then node importera.mjs --sedan "$SEDAN"; else node importera.mjs; fi
+          node kor.mjs
+      - name: Skriv utkast till nya mejl
+        if: (github.event_name == 'schedule' && github.event.schedule != '23 6 * * 1') || inputs.lage == 'kor'
+        run: node kor.mjs
+      - name: Spara nya regler
+        # Only when a reply to the weekly report added rules. A push with this workflow's own
+        # token starts no other workflow, so the site is not rebuilt for it.
+        if: always() && ((github.event_name == 'schedule' && github.event.schedule != '23 6 * * 1') || inputs.lage == 'kor')
+        working-directory: ${{ github.workspace }}
+        run: |
+          if git diff --quiet -- regler.md; then exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add regler.md
+          git commit -m "Mejlagenten: nya regler från svar på veckorapporten"
+          for i in 1 2 3; do
+            git pull --rebase origin "$GITHUB_REF_NAME" && git push origin "HEAD:$GITHUB_REF_NAME" && exit 0
+            sleep 5
+          done
+          echo "Reglerna gick inte att spara i repot. De står i körningens sammanfattning."
+          exit 1
+      - name: Veckorapport
+        if: (github.event_name == 'schedule' && github.event.schedule == '23 6 * * 1') || inputs.lage == 'rapport'
+        run: node rapport.mjs
